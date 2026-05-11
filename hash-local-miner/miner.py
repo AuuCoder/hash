@@ -5,6 +5,7 @@ import argparse
 from collections import deque
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -38,6 +39,7 @@ READ_ABI = {
     "getChallenge": "getChallenge(address)",
 }
 MINE_SIGNATURE = "mine(uint256)"
+VALID_BACKENDS = ("cpu", "metal", "opencl")
 
 
 def load_dotenv(dotenv_path: Path) -> dict[str, str]:
@@ -265,6 +267,8 @@ def default_threads() -> int:
 def default_backend() -> str:
     if sys.platform == "darwin":
         return "metal"
+    if sys.platform.startswith("win"):
+        return "opencl"
     return "cpu"
 
 
@@ -277,6 +281,44 @@ def worker_binary(root: Path) -> Path:
     return root / "rust-worker" / "target" / "release" / f"hash256-rust-worker{suffix}"
 
 
+def normalize_backend(raw: str) -> str:
+    backend = raw.strip().lower()
+    if backend not in VALID_BACKENDS:
+        allowed = ", ".join(VALID_BACKENDS)
+        raise SystemExit(f"不支持的 backend: {raw}；可选值: {allowed}")
+    return backend
+
+
+def find_cargo_executable() -> str:
+    candidates: list[str] = []
+    env_cargo = os.environ.get("CARGO")
+    if env_cargo:
+        candidates.append(env_cargo)
+
+    cargo_in_path = shutil.which("cargo")
+    if cargo_in_path:
+        candidates.append(cargo_in_path)
+
+    home = Path.home()
+    if sys.platform.startswith("win"):
+        candidates.append(str(home / ".cargo" / "bin" / "cargo.exe"))
+    else:
+        candidates.append(str(home / ".cargo" / "bin" / "cargo"))
+
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+
+    if sys.platform.startswith("win"):
+        raise RuntimeError(
+            "没有找到 Rust/Cargo。请先安装 Rust for Windows（推荐 rustup），安装后重新打开 PowerShell，再运行 "
+            "`python miner.py --submit`。AMD 显卡如果要跑 GPU，还需要安装带 OpenCL 的 AMD Adrenalin 驱动。"
+        )
+    raise RuntimeError(
+        "没有找到 Rust/Cargo。请先安装 Rust toolchain（cargo / rustc）后再运行 miner.py。"
+    )
+
+
 def ensure_worker_built(root: Path) -> Path:
     binary = worker_binary(root)
     if binary.exists():
@@ -285,8 +327,9 @@ def ensure_worker_built(root: Path) -> Path:
     print("[build] compiling Rust worker...", flush=True)
     build_env = os.environ.copy()
     build_env.setdefault("CARGO_HOME", str(root / ".cargo-local"))
+    cargo = find_cargo_executable()
     result = subprocess.run(
-        ["cargo", "build", "--release"],
+        [cargo, "build", "--release"],
         cwd=root / "rust-worker",
         text=True,
         env=build_env,
@@ -506,7 +549,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--submit-rpc-url", default=env_value("HASH256_SUBMIT_RPC_URL", dotenv))
     parser.add_argument("--address", default=env_value("HASH256_MINER_ADDRESS", dotenv))
     parser.add_argument("--private-key", default=env_value("HASH256_PRIVATE_KEY", dotenv))
-    parser.add_argument("--backend", default=env_value("HASH256_BACKEND", dotenv, default_backend()))
+    parser.add_argument(
+        "--backend",
+        default=env_value("HASH256_BACKEND", dotenv, default_backend()),
+        help="worker 后端，可选: cpu / metal / opencl",
+    )
     parser.add_argument(
         "--threads",
         type=int,
@@ -549,7 +596,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-mining", dest="keep_mining", action="store_true", help="持续挖矿")
     parser.add_argument("--no-keep-mining", dest="keep_mining", action="store_false", help="提交后停止")
     parser.set_defaults(keep_mining=env_flag("HASH256_KEEP_MINING", dotenv, True))
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.backend = normalize_backend(args.backend)
+    return args
 
 
 def resolve_account(args: argparse.Namespace) -> tuple[str, LocalAccount | None]:
@@ -658,8 +707,8 @@ def main() -> int:
                 poll_cb=poll_chain,
             )
         except RuntimeError as exc:
-            if worker_backend == "metal":
-                print(f"[警告] Metal worker 异常退出，自动切换到 CPU。\n{exc}", flush=True)
+            if worker_backend in {"metal", "opencl"}:
+                print(f"[警告] {worker_backend.upper()} worker 异常退出，自动切换到 CPU。\n{exc}", flush=True)
                 worker_backend = "cpu"
                 print(f"[算力配置] backend={worker_backend} threads={args.threads} batch_size={args.batch_size}", flush=True)
                 continue

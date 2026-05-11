@@ -1,4 +1,5 @@
 mod metal_backend;
+mod opencl_backend;
 
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -31,6 +32,7 @@ impl std::error::Error for CliError {}
 enum Backend {
     Cpu,
     Metal,
+    Opencl,
 }
 
 impl Backend {
@@ -38,6 +40,7 @@ impl Backend {
         match value {
             "cpu" => Ok(Self::Cpu),
             "metal" => Ok(Self::Metal),
+            "opencl" => Ok(Self::Opencl),
             other => Err(CliError::Message(format!("invalid --backend: {other}"))),
         }
     }
@@ -102,6 +105,7 @@ fn run() -> Result<(), CliError> {
     match cfg.backend {
         Backend::Cpu => run_cpu(&cfg),
         Backend::Metal => metal_backend::run(&cfg),
+        Backend::Opencl => opencl_backend::run(&cfg),
     }
 }
 

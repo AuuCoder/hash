@@ -1,17 +1,12 @@
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "macos"))]
 mod imp {
     use crate::{emit, emit_progress, hex_string, CliError, Config, Event};
-    use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
-    use objc::rc::autoreleasepool;
+    use ocl::{flags, Buffer, Device, Platform, ProQue};
     use rand::RngCore;
-    use std::mem::size_of;
     use std::time::{Duration, Instant};
 
-    const SHADER_SOURCE: &str = r#"
-        #include <metal_stdlib>
-        using namespace metal;
-
-        struct Params {
+    const KERNEL_SOURCE: &str = r#"
+        typedef struct {
             ulong challenge[4];
             ulong nonce_prefix[2];
             ulong difficulty[4];
@@ -19,32 +14,32 @@ mod imp {
             ulong counter_lo;
             uint batch_size;
             uint _padding;
-        };
+        } Params;
 
-        struct Result {
-            atomic_uint found;
+        typedef struct {
+            int found;
             uint gid;
             ulong digest[4];
-        };
+        } ResultData;
 
-        constant uint KECCAKF_ROTC[24] = {
+        __constant uint KECCAKF_ROTC[24] = {
             1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14,
             27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44
         };
 
-        constant uint KECCAKF_PILN[24] = {
+        __constant uint KECCAKF_PILN[24] = {
             10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4,
             15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1
         };
 
-        constant ulong KECCAKF_RNDC[24] = {
+        __constant ulong KECCAKF_RNDC[24] = {
             0x0000000000000001UL, 0x0000000000008082UL,
             0x800000000000808aUL, 0x8000000080008000UL,
             0x000000000000808bUL, 0x0000000080000001UL,
             0x8000000080008081UL, 0x8000000000008009UL,
             0x000000000000008aUL, 0x0000000000000088UL,
             0x0000000080008009UL, 0x000000008000000aUL,
-            0x000000008000808bUL, 0x800000000000008bUL,
+            0x800000008000808bUL, 0x800000000000008bUL,
             0x8000000000008089UL, 0x8000000000008003UL,
             0x8000000000008002UL, 0x8000000000000080UL,
             0x000000000000800aUL, 0x800000008000000aUL,
@@ -67,8 +62,8 @@ mod imp {
                    ((x & 0xff00000000000000UL) >> 56);
         }
 
-        inline void keccakf(thread ulong st[25]) {
-            thread ulong bc[5];
+        inline void keccakf(ulong st[25]) {
+            ulong bc[5];
             ulong t;
 
             for (uint round = 0; round < 24; ++round) {
@@ -106,7 +101,7 @@ mod imp {
             }
         }
 
-        inline bool digest_lt(thread const ulong st[25], constant Params& params) {
+        inline int digest_lt(ulong st[25], __global const Params* params) {
             ulong words[4] = {
                 bswap64(st[0]),
                 bswap64(st[1]),
@@ -115,44 +110,41 @@ mod imp {
             };
 
             for (uint i = 0; i < 4; ++i) {
-                if (words[i] < params.difficulty[i]) {
-                    return true;
+                if (words[i] < params->difficulty[i]) {
+                    return 1;
                 }
-                if (words[i] > params.difficulty[i]) {
-                    return false;
+                if (words[i] > params->difficulty[i]) {
+                    return 0;
                 }
             }
-            return false;
+            return 0;
         }
 
-        kernel void hash256_search(
-            constant Params& params [[buffer(0)]],
-            device Result* result [[buffer(1)]],
-            uint gid [[thread_position_in_grid]]
-        ) {
-            if (gid >= params.batch_size) {
+        __kernel void hash256_search(__global const Params* params, __global ResultData* result) {
+            uint gid = get_global_id(0);
+            if (gid >= params->batch_size) {
                 return;
             }
 
-            ulong counter_lo = params.counter_lo + (ulong)gid;
-            ulong carry = counter_lo < params.counter_lo ? 1UL : 0UL;
-            ulong counter_hi = params.counter_hi + carry;
+            ulong counter_lo = params->counter_lo + (ulong)gid;
+            ulong carry = counter_lo < params->counter_lo ? 1UL : 0UL;
+            ulong counter_hi = params->counter_hi + carry;
 
-            thread ulong st[25];
+            ulong st[25];
             for (uint i = 0; i < 25; ++i) {
                 st[i] = 0UL;
             }
 
-            st[0] = params.challenge[0];
-            st[1] = params.challenge[1];
-            st[2] = params.challenge[2];
-            st[3] = params.challenge[3];
-            st[4] = params.nonce_prefix[0];
-            st[5] = params.nonce_prefix[1];
+            st[0] = params->challenge[0];
+            st[1] = params->challenge[1];
+            st[2] = params->challenge[2];
+            st[3] = params->challenge[3];
+            st[4] = params->nonce_prefix[0];
+            st[5] = params->nonce_prefix[1];
             st[6] = bswap64(counter_hi);
             st[7] = bswap64(counter_lo);
-            st[8] ^= 0x01UL;
-            st[16] ^= 0x8000000000000000UL;
+            st[8] = 0x01UL;
+            st[16] = 0x8000000000000000UL;
 
             keccakf(st);
 
@@ -160,7 +152,7 @@ mod imp {
                 return;
             }
 
-            if (atomic_fetch_or_explicit(&(result->found), 1u, memory_order_relaxed) == 0u) {
+            if (atomic_cmpxchg((volatile __global int*)&result->found, 0, 1) == 0) {
                 result->gid = gid;
                 result->digest[0] = bswap64(st[0]);
                 result->digest[1] = bswap64(st[1]);
@@ -171,6 +163,7 @@ mod imp {
     "#;
 
     #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
     struct Params {
         challenge: [u64; 4],
         nonce_prefix: [u64; 2],
@@ -181,30 +174,46 @@ mod imp {
         padding: u32,
     }
 
+    unsafe impl ocl::OclPrm for Params {}
+
     #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
     struct ResultData {
-        found: u32,
+        found: i32,
         gid: u32,
         digest: [u64; 4],
     }
 
-    pub(crate) fn run(cfg: &Config) -> Result<(), CliError> {
-        autoreleasepool(|| run_impl(cfg))
-    }
+    unsafe impl ocl::OclPrm for ResultData {}
 
-    fn run_impl(cfg: &Config) -> Result<(), CliError> {
-        let device = Device::system_default()
-            .ok_or_else(|| CliError::Message("Metal device not available".into()))?;
-        let command_queue = device.new_command_queue();
-        let pipeline_state = create_pipeline_state(&device)?;
-        let params_buffer = device.new_buffer(
-            size_of::<Params>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let result_buffer = device.new_buffer(
-            size_of::<ResultData>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+    pub(crate) fn run(cfg: &Config) -> Result<(), CliError> {
+        let (platform, device) = select_device()?;
+        let pro_que = ProQue::builder()
+            .platform(platform)
+            .device(device)
+            .src(KERNEL_SOURCE)
+            .dims(cfg.batch_size as usize)
+            .build()
+            .map_err(ocl_error)?;
+
+        let params_buffer = Buffer::<Params>::builder()
+            .queue(pro_que.queue().clone())
+            .flags(flags::MEM_READ_ONLY)
+            .len(1)
+            .build()
+            .map_err(ocl_error)?;
+        let result_buffer = Buffer::<ResultData>::builder()
+            .queue(pro_que.queue().clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(1)
+            .build()
+            .map_err(ocl_error)?;
+        let kernel = pro_que
+            .kernel_builder("hash256_search")
+            .arg(&params_buffer)
+            .arg(&result_buffer)
+            .build()
+            .map_err(ocl_error)?;
 
         let mut rng = rand::thread_rng();
         let mut prefix = [0u8; 16];
@@ -213,40 +222,57 @@ mod imp {
         rng.fill_bytes(&mut counter_bytes);
         let mut counter = u128::from_be_bytes(counter_bytes);
 
-        let params = Params {
-            challenge: bytes_to_u64x4_le(&cfg.challenge),
-            nonce_prefix: [
-                u64::from_le_bytes(prefix[0..8].try_into().unwrap()),
-                u64::from_le_bytes(prefix[8..16].try_into().unwrap()),
-            ],
-            difficulty: bytes_to_u64x4_be(&cfg.difficulty),
-            counter_hi: 0,
-            counter_lo: 0,
-            batch_size: cfg.batch_size,
-            padding: 0,
-        };
+        let challenge = bytes_to_u64x4_le(&cfg.challenge);
+        let difficulty = bytes_to_u64x4_be(&cfg.difficulty);
+        let nonce_prefix = [
+            u64::from_le_bytes(prefix[0..8].try_into().unwrap()),
+            u64::from_le_bytes(prefix[8..16].try_into().unwrap()),
+        ];
 
         let started = Instant::now();
         let mut last_progress = Instant::now();
         let mut total_hashes = 0u64;
 
         loop {
-            write_params(&params_buffer, &params, counter);
-            reset_result(&result_buffer);
+            let params = Params {
+                challenge,
+                nonce_prefix,
+                difficulty,
+                counter_hi: (counter >> 64) as u64,
+                counter_lo: counter as u64,
+                batch_size: cfg.batch_size,
+                padding: 0,
+            };
+            let params_src = [params];
+            params_buffer
+                .write(&params_src[..])
+                .enq()
+                .map_err(ocl_error)?;
+            let result_reset = [ResultData::default()];
+            result_buffer
+                .write(&result_reset[..])
+                .enq()
+                .map_err(ocl_error)?;
 
-            dispatch_batch(
-                &command_queue,
-                &pipeline_state,
-                &params_buffer,
-                &result_buffer,
-                cfg.batch_size,
-            )?;
+            unsafe {
+                kernel
+                    .cmd()
+                    .global_work_size(cfg.batch_size as usize)
+                    .enq()
+                    .map_err(ocl_error)?;
+            }
+            pro_que.queue().finish().map_err(ocl_error)?;
 
             total_hashes = total_hashes.saturating_add(cfg.batch_size as u64);
-            let result = read_result(&result_buffer);
+            let mut results = [ResultData::default()];
+            result_buffer
+                .read(&mut results[..])
+                .enq()
+                .map_err(ocl_error)?;
+            let result = results[0];
+
             if result.found != 0 {
-                let gid = result.gid as u128;
-                let hit_counter = counter.wrapping_add(gid);
+                let hit_counter = counter.wrapping_add(result.gid as u128);
                 let nonce = build_nonce(prefix, hit_counter);
                 let digest = digest_words_to_bytes(result.digest);
                 emit(&Event::Hit {
@@ -271,82 +297,48 @@ mod imp {
         }
     }
 
-    fn create_pipeline_state(device: &Device) -> Result<ComputePipelineState, CliError> {
-        let options = CompileOptions::new();
-        let library = device
-            .new_library_with_source(SHADER_SOURCE, &options)
-            .map_err(|err| CliError::Message(format!("Metal shader compile failed: {err}")))?;
-        let kernel = library
-            .get_function("hash256_search", None)
-            .map_err(|err| CliError::Message(format!("Metal kernel lookup failed: {err}")))?;
-        device
-            .new_compute_pipeline_state_with_function(&kernel)
-            .map_err(|err| CliError::Message(format!("Metal pipeline creation failed: {err}")))
-    }
-
-    fn dispatch_batch(
-        command_queue: &metal::CommandQueue,
-        pipeline_state: &ComputePipelineState,
-        params_buffer: &Buffer,
-        result_buffer: &Buffer,
-        batch_size: u32,
-    ) -> Result<(), CliError> {
-        let command_buffer = command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(pipeline_state);
-        encoder.set_buffer(0, Some(params_buffer), 0);
-        encoder.set_buffer(1, Some(result_buffer), 0);
-
-        let threads_per_group = pipeline_state.thread_execution_width().max(1);
-        let threadgroup_size = MTLSize {
-            width: threads_per_group as u64,
-            height: 1,
-            depth: 1,
-        };
-        let groups = (batch_size as u64 + threadgroup_size.width - 1) / threadgroup_size.width;
-        let threadgroup_count = MTLSize {
-            width: groups,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatch_thread_groups(threadgroup_count, threadgroup_size);
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-
-        Ok(())
-    }
-
-    fn write_params(buffer: &Buffer, template: &Params, counter: u128) {
-        let params = unsafe { &mut *buffer.contents().cast::<Params>() };
-        *params = Params {
-            challenge: template.challenge,
-            nonce_prefix: template.nonce_prefix,
-            difficulty: template.difficulty,
-            counter_hi: (counter >> 64) as u64,
-            counter_lo: counter as u64,
-            batch_size: template.batch_size,
-            padding: 0,
-        };
-    }
-
-    fn reset_result(buffer: &Buffer) {
-        let result = unsafe { &mut *buffer.contents().cast::<ResultData>() };
-        *result = ResultData {
-            found: 0,
-            gid: 0,
-            digest: [0; 4],
-        };
-    }
-
-    fn read_result(buffer: &Buffer) -> ResultData {
-        let result = unsafe { &*buffer.contents().cast::<ResultData>() };
-        ResultData {
-            found: result.found,
-            gid: result.gid,
-            digest: result.digest,
+    fn select_device() -> Result<(Platform, Device), CliError> {
+        let platforms = Platform::list();
+        if platforms.is_empty() {
+            return Err(CliError::Message(
+                "OpenCL platform not found. Windows + AMD 请先安装带 OpenCL 运行时的 AMD Adrenalin 驱动。".into(),
+            ));
         }
+
+        let mut first_gpu: Option<(Platform, Device)> = None;
+        let mut first_device: Option<(Platform, Device)> = None;
+
+        for platform in platforms {
+            for device in Device::list(platform, Some(flags::DEVICE_TYPE_GPU)).unwrap_or_default() {
+                let vendor = device.vendor().unwrap_or_default().to_ascii_lowercase();
+                let name = device.name().unwrap_or_default().to_ascii_lowercase();
+                if vendor.contains("amd")
+                    || vendor.contains("advanced micro devices")
+                    || name.contains("radeon")
+                {
+                    return Ok((platform, device));
+                }
+                if first_gpu.is_none() {
+                    first_gpu = Some((platform, device));
+                }
+            }
+
+            if first_device.is_none() {
+                if let Some(device) = Device::list_all(platform).unwrap_or_default().into_iter().next() {
+                    first_device = Some((platform, device));
+                }
+            }
+        }
+
+        first_gpu.or(first_device).ok_or_else(|| {
+            CliError::Message(
+                "没有找到可用的 OpenCL 设备。请确认 AMD 显卡驱动已安装，并且系统里能看到 OpenCL GPU。".into(),
+            )
+        })
+    }
+
+    fn ocl_error(err: ocl::Error) -> CliError {
+        CliError::Message(format!("OpenCL worker failed: {err}"))
     }
 
     fn build_nonce(prefix: [u8; 16], counter: u128) -> [u8; 32] {
@@ -384,13 +376,13 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "macos")]
 mod imp {
     use crate::{CliError, Config};
 
     pub(crate) fn run(_cfg: &Config) -> Result<(), CliError> {
         Err(CliError::Message(
-            "Metal backend is only available on macOS".into(),
+            "OpenCL backend is not enabled on macOS in this project; use --backend metal instead.".into(),
         ))
     }
 }

@@ -1,4 +1,4 @@
-# HASH256 Hybrid Miner for macOS
+# HASH256 Hybrid Miner for macOS / Windows
 
 Python 负责链上交互和控制流程，Rust 负责高速搜索 `keccak256(challenge || nonce)`。
 
@@ -9,10 +9,11 @@ Python 负责链上交互和控制流程，Rust 负责高速搜索 `keccak256(ch
 
 ## 特性
 
-- 支持 macOS 本地运行
+- 支持 macOS / Windows 本地运行
 - Python + Rust 混合架构
-- 支持 `cpu` / `metal` 两种 worker 后端
+- 支持 `cpu` / `metal` / `opencl` 三种 worker 后端
 - 在 Apple Silicon Mac 上默认使用 `metal` GPU 后端
+- 在 Windows 上默认使用 `opencl`，优先选择 AMD GPU
 - 默认安全模式：只搜索，不自动提交交易
 - 提供私钥后可自动签名并广播 `mine(nonce)`
 - 算力速率自动显示成 `MH/s`、`GH/s` 等更直观单位
@@ -32,16 +33,42 @@ Python 负责链上交互和控制流程，Rust 负责高速搜索 `keccak256(ch
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+macOS:
+
+```bash
+source .venv/bin/activate
+```
+
+Windows PowerShell:
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+Windows 需要额外准备：
+
+- Rust toolchain（`cargo` / `rustc`，推荐用 `rustup` 安装）
+- AMD 显卡驱动（Adrenalin），确保 OpenCL runtime 已安装
+
 Rust worker 第一次运行会自动编译；也可以手动先编译：
+
+macOS / Linux:
 
 ```bash
 cd rust-worker
 cargo build --release
 cd ..
+```
+
+Windows PowerShell:
+
+```powershell
+Set-Location rust-worker
+cargo build --release
+Set-Location ..
 ```
 
 ## 配置
@@ -82,6 +109,13 @@ HASH256_BACKEND=metal
 HASH256_BATCH_SIZE=1048576
 ```
 
+Windows + AMD 显卡建议这样写：
+
+```text
+HASH256_BACKEND=opencl
+HASH256_BATCH_SIZE=1048576
+```
+
 ## 搜索并自动提交
 
 ```bash
@@ -101,7 +135,7 @@ HASH256_SUBMIT_RPC_URL=https://rpc.flashbots.net/fast
 ## 常用参数
 
 - `--threads 7`：Rust worker 线程数
-- `--backend cpu|metal`：切换 CPU 或 Metal GPU 后端
+- `--backend cpu|metal|opencl`：切换 CPU / Metal / OpenCL 后端
 - `--batch-size 1048576`：每批次提交给 worker 的 nonce 数量
 - `--poll-interval 12`：每多少秒检查一次 challenge / difficulty 是否变化
 - `--submit`：自动签名并广播 mint 交易
@@ -120,8 +154,10 @@ HASH256_SUBMIT_RPC_URL=https://rpc.flashbots.net/fast
 - 脚本会在 epoch 或 difficulty 改变时自动重启 worker，避免用陈旧 challenge 提交无效 nonce。
 - 自动提交模式下，回执检查在后台进行，不会因为等待确认而中断挖矿。
 - 默认会限制单钱包只有 1 笔 pending 提交，这通常比堆很多同 nonce 序列交易更不容易把自己卡住。
-- `metal` 后端目前只在 macOS 上可用；如果在受限环境里跑不到 GPU，可以先回退到 `cpu`。
-- 如果 `metal` worker 异常退出，`miner.py` 现在会自动回退到 `cpu` 并继续运行。
+- `metal` 后端只在 macOS 上可用。
+- `opencl` 后端主要给 Windows / AMD GPU 使用；程序会优先选择 AMD 显卡。
+- 如果 `metal` 或 `opencl` worker 异常退出，`miner.py` 会自动回退到 `cpu` 并继续运行。
+- 如果 Windows 上第一次运行直接报找不到 `cargo`，先安装 Rust，再重新打开 PowerShell。
 - 纯 Python 并不负责高速哈希；性能主要来自 Rust worker。
 
 ## 预期输出
