@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import subprocess
@@ -331,6 +332,7 @@ def run_worker(
     )
     assert proc.stdout is not None
     last_event: dict[str, Any] | None = None
+    recent_output: deque[str] = deque(maxlen=20)
 
     try:
         while True:
@@ -340,7 +342,14 @@ def run_worker(
                     break
                 continue
 
-            event = json.loads(line)
+            stripped = line.strip()
+            if stripped:
+                recent_output.append(stripped)
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             last_event = event
             event_type = event.get("type")
 
@@ -370,7 +379,13 @@ def run_worker(
 
     if last_event and last_event.get("type") == "stopped":
         return last_event
-    raise RuntimeError("worker exited unexpectedly")
+
+    exit_code = proc.returncode
+    tail = "\n".join(recent_output)
+    details = f"worker exited unexpectedly (code={exit_code})"
+    if tail:
+        details += f"\nrecent output:\n{tail}"
+    raise RuntimeError(details)
 
 
 def choose_fee_params(
@@ -560,8 +575,9 @@ def main() -> int:
 
     chain_id = rpc.chain_id()
     block_number = rpc.block_number()
+    worker_backend = args.backend
     print(f"[连接成功] chain_id={chain_id} 当前区块={block_number} miner={miner_address}", flush=True)
-    print(f"[算力配置] backend={args.backend} threads={args.threads} batch_size={args.batch_size}", flush=True)
+    print(f"[算力配置] backend={worker_backend} threads={args.threads} batch_size={args.batch_size}", flush=True)
     if args.submit:
         print(
             "[自动提交] 已开启 | 持续挖矿=%s | submit-rpc=%s | 最低小费=%s gwei | max-fee倍数=%s | 最多待确认=%s"
@@ -630,16 +646,24 @@ def main() -> int:
                 return "challenge rotated"
             return None
 
-        result = run_worker(
-            binary=binary,
-            challenge_hex=challenge_hex,
-            difficulty_int=mining_state.difficulty,
-            backend=args.backend,
-            threads=args.threads,
-            batch_size=args.batch_size,
-            progress_ms=args.progress_ms,
-            poll_cb=poll_chain,
-        )
+        try:
+            result = run_worker(
+                binary=binary,
+                challenge_hex=challenge_hex,
+                difficulty_int=mining_state.difficulty,
+                backend=worker_backend,
+                threads=args.threads,
+                batch_size=args.batch_size,
+                progress_ms=args.progress_ms,
+                poll_cb=poll_chain,
+            )
+        except RuntimeError as exc:
+            if worker_backend == "metal":
+                print(f"[警告] Metal worker 异常退出，自动切换到 CPU。\n{exc}", flush=True)
+                worker_backend = "cpu"
+                print(f"[算力配置] backend={worker_backend} threads={args.threads} batch_size={args.batch_size}", flush=True)
+                continue
+            raise
 
         if result["type"] == "restart":
             print(f"[重新开始] {format_restart_reason(result['reason'])}", flush=True)

@@ -1,5 +1,8 @@
 .venv/
 .cargo-local/
-rust-worker/target/
+**/.cargo-local/
+**/rust-worker/target/
 __pycache__/
+**/__pycache__/
 .env
+**/.env
