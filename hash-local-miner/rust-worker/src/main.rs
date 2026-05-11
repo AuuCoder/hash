@@ -1,4 +1,5 @@
 mod metal_backend;
+mod cuda_backend;
 mod opencl_backend;
 
 use rand::rngs::StdRng;
@@ -32,6 +33,7 @@ impl std::error::Error for CliError {}
 enum Backend {
     Cpu,
     Metal,
+    Cuda,
     Opencl,
 }
 
@@ -40,6 +42,7 @@ impl Backend {
         match value {
             "cpu" => Ok(Self::Cpu),
             "metal" => Ok(Self::Metal),
+            "cuda" => Ok(Self::Cuda),
             "opencl" => Ok(Self::Opencl),
             other => Err(CliError::Message(format!("invalid --backend: {other}"))),
         }
@@ -54,6 +57,9 @@ struct Config {
     progress_ms: u64,
     backend: Backend,
     batch_size: u32,
+    work_group_size: Option<usize>,
+    cuda_device: usize,
+    cuda_block_size: u32,
 }
 
 #[derive(Serialize)]
@@ -105,6 +111,7 @@ fn run() -> Result<(), CliError> {
     match cfg.backend {
         Backend::Cpu => run_cpu(&cfg),
         Backend::Metal => metal_backend::run(&cfg),
+        Backend::Cuda => cuda_backend::run(&cfg),
         Backend::Opencl => opencl_backend::run(&cfg),
     }
 }
@@ -220,6 +227,9 @@ fn parse_args() -> Result<Config, CliError> {
     let mut progress_ms = 1000u64;
     let mut backend = Backend::Cpu;
     let mut batch_size = 1_048_576u32;
+    let mut work_group_size = None;
+    let mut cuda_device = 0usize;
+    let mut cuda_block_size = 256u32;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -257,6 +267,32 @@ fn parse_args() -> Result<Config, CliError> {
                 }
                 batch_size = parsed;
             }
+            "--work-group-size" => {
+                let raw = next_arg(&mut args, "--work-group-size")?;
+                let parsed = raw
+                    .parse::<usize>()
+                    .map_err(|_| CliError::Message(format!("invalid --work-group-size: {raw}")))?;
+                if parsed == 0 {
+                    return Err(CliError::Message("--work-group-size must be >= 1".into()));
+                }
+                work_group_size = Some(parsed);
+            }
+            "--cuda-device" => {
+                let raw = next_arg(&mut args, "--cuda-device")?;
+                cuda_device = raw
+                    .parse::<usize>()
+                    .map_err(|_| CliError::Message(format!("invalid --cuda-device: {raw}")))?;
+            }
+            "--cuda-block-size" => {
+                let raw = next_arg(&mut args, "--cuda-block-size")?;
+                let parsed = raw
+                    .parse::<u32>()
+                    .map_err(|_| CliError::Message(format!("invalid --cuda-block-size: {raw}")))?;
+                if parsed == 0 {
+                    return Err(CliError::Message("--cuda-block-size must be >= 1".into()));
+                }
+                cuda_block_size = parsed;
+            }
             other => {
                 return Err(CliError::Message(format!("unknown arg: {other}")));
             }
@@ -270,6 +306,9 @@ fn parse_args() -> Result<Config, CliError> {
         progress_ms,
         backend,
         batch_size,
+        work_group_size,
+        cuda_device,
+        cuda_block_size,
     })
 }
 

@@ -11,8 +11,9 @@ Python 负责链上交互和控制流程，Rust 负责高速搜索 `keccak256(ch
 
 - 支持 macOS / Windows 本地运行
 - Python + Rust 混合架构
-- 支持 `cpu` / `metal` / `opencl` 三种 worker 后端
+- 支持 `cpu` / `metal` / `cuda` / `opencl` 四种 worker 后端
 - 在 Apple Silicon Mac 上默认使用 `metal` GPU 后端
+- 在 Windows + NVIDIA 上可切换到 `cuda` 后端
 - 在 Windows 上默认使用 `opencl`，优先选择 AMD GPU
 - 默认安全模式：只搜索，不自动提交交易
 - 提供私钥后可自动签名并广播 `mine(nonce)`
@@ -114,7 +115,19 @@ Windows + AMD 显卡建议这样写：
 ```text
 HASH256_BACKEND=opencl
 HASH256_BATCH_SIZE=1048576
+HASH256_OPENCL_WORK_GROUP_SIZE=256
 ```
+
+Windows + NVIDIA 显卡建议这样写：
+
+```text
+HASH256_BACKEND=cuda
+HASH256_BATCH_SIZE=2097152
+HASH256_CUDA_BLOCK_SIZE=256
+HASH256_CUDA_DEVICE=0
+```
+
+`cuda` 后端当前依赖 NVIDIA 驱动，以及系统里可用的 CUDA NVRTC 运行时。
 
 ## 搜索并自动提交
 
@@ -135,8 +148,11 @@ HASH256_SUBMIT_RPC_URL=https://rpc.flashbots.net/fast
 ## 常用参数
 
 - `--threads 7`：Rust worker 线程数
-- `--backend cpu|metal|opencl`：切换 CPU / Metal / OpenCL 后端
+- `--backend cpu|metal|cuda|opencl`：切换 CPU / Metal / CUDA / OpenCL 后端
 - `--batch-size 1048576`：每批次提交给 worker 的 nonce 数量
+- `--work-group-size 256`：OpenCL 本地 work-group size；AMD 一般可以试 `128` / `256`
+- `--cuda-device 0`：CUDA 设备序号
+- `--cuda-block-size 256`：CUDA block size；NVIDIA 一般可试 `128` / `256` / `512`
 - `--poll-interval 12`：每多少秒检查一次 challenge / difficulty 是否变化
 - `--submit`：自动签名并广播 mint 交易
 - `--no-keep-mining`：提交一笔后停止
@@ -155,8 +171,11 @@ HASH256_SUBMIT_RPC_URL=https://rpc.flashbots.net/fast
 - 自动提交模式下，回执检查在后台进行，不会因为等待确认而中断挖矿。
 - 默认会限制单钱包只有 1 笔 pending 提交，这通常比堆很多同 nonce 序列交易更不容易把自己卡住。
 - `metal` 后端只在 macOS 上可用。
+- `cuda` 后端主要给 Windows / NVIDIA GPU 使用；当前需要系统里有 NVRTC。
 - `opencl` 后端主要给 Windows / AMD GPU 使用；程序会优先选择 AMD 显卡。
-- 如果 `metal` 或 `opencl` worker 异常退出，`miner.py` 会自动回退到 `cpu` 并继续运行。
+- `cuda` 后端里 `--threads` 基本不会影响 GPU 算力，主要看 `--batch-size` 和 `--cuda-block-size`。
+- `opencl` 后端里 `--threads` 基本不会影响 GPU 算力，主要看 `--batch-size` 和 `--work-group-size`。
+- 如果 `metal` / `cuda` / `opencl` worker 异常退出，`miner.py` 会自动回退到 `cpu` 并继续运行。
 - 如果 Windows 上第一次运行直接报找不到 `cargo`，先安装 Rust，再重新打开 PowerShell。
 - 纯 Python 并不负责高速哈希；性能主要来自 Rust worker。
 

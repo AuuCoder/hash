@@ -188,11 +188,13 @@ mod imp {
 
     pub(crate) fn run(cfg: &Config) -> Result<(), CliError> {
         let (platform, device) = select_device()?;
+        let work_group_size = resolve_work_group_size(&device, cfg.work_group_size)?;
+        let global_work_size = round_up_to_multiple(cfg.batch_size as usize, work_group_size);
         let pro_que = ProQue::builder()
             .platform(platform)
             .device(device)
             .src(KERNEL_SOURCE)
-            .dims(cfg.batch_size as usize)
+            .dims(global_work_size)
             .build()
             .map_err(ocl_error)?;
 
@@ -257,7 +259,8 @@ mod imp {
             unsafe {
                 kernel
                     .cmd()
-                    .global_work_size(cfg.batch_size as usize)
+                    .global_work_size(global_work_size)
+                    .local_work_size(work_group_size)
                     .enq()
                     .map_err(ocl_error)?;
             }
@@ -339,6 +342,42 @@ mod imp {
 
     fn ocl_error(err: ocl::Error) -> CliError {
         CliError::Message(format!("OpenCL worker failed: {err}"))
+    }
+
+    fn resolve_work_group_size(
+        device: &Device,
+        requested: Option<usize>,
+    ) -> Result<usize, CliError> {
+        let max_work_group_size = device.max_wg_size().map_err(ocl_error)?;
+        if max_work_group_size == 0 {
+            return Err(CliError::Message(
+                "OpenCL device reported max work-group size = 0".into(),
+            ));
+        }
+
+        if let Some(value) = requested {
+            if value > max_work_group_size {
+                return Err(CliError::Message(format!(
+                    "OpenCL work-group size {value} exceeds device max {max_work_group_size}"
+                )));
+            }
+            return Ok(value);
+        }
+
+        for candidate in [256usize, 128, 64, 32, 16, 8, 4, 2, 1] {
+            if candidate <= max_work_group_size {
+                return Ok(candidate);
+            }
+        }
+
+        Ok(1)
+    }
+
+    fn round_up_to_multiple(value: usize, multiple: usize) -> usize {
+        if multiple <= 1 {
+            return value;
+        }
+        value.div_ceil(multiple) * multiple
     }
 
     fn build_nonce(prefix: [u8; 16], counter: u128) -> [u8; 32] {

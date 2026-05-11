@@ -39,7 +39,7 @@ READ_ABI = {
     "getChallenge": "getChallenge(address)",
 }
 MINE_SIGNATURE = "mine(uint256)"
-VALID_BACKENDS = ("cpu", "metal", "opencl")
+VALID_BACKENDS = ("cpu", "metal", "cuda", "opencl")
 
 
 def load_dotenv(dotenv_path: Path) -> dict[str, str]:
@@ -276,9 +276,56 @@ def default_batch_size() -> int:
     return 1_048_576
 
 
+def default_work_group_size(dotenv: dict[str, str]) -> int | None:
+    raw = env_value("HASH256_OPENCL_WORK_GROUP_SIZE", dotenv)
+    if raw is None or not raw.strip():
+        return None
+    return int(raw)
+
+
+def default_cuda_device(dotenv: dict[str, str]) -> int:
+    return int(env_value("HASH256_CUDA_DEVICE", dotenv, "0"))
+
+
+def default_cuda_block_size(dotenv: dict[str, str]) -> int:
+    return int(env_value("HASH256_CUDA_BLOCK_SIZE", dotenv, "256"))
+
+
 def worker_binary(root: Path) -> Path:
     suffix = ".exe" if sys.platform.startswith("win") else ""
     return root / "rust-worker" / "target" / "release" / f"hash256-rust-worker{suffix}"
+
+
+def worker_sources(root: Path) -> list[Path]:
+    worker_root = root / "rust-worker"
+    patterns = (
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "src/**/*.rs",
+    )
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(worker_root.glob(pattern))
+    return [path for path in paths if path.is_file()]
+
+
+def worker_needs_rebuild(root: Path, binary: Path) -> bool:
+    if not binary.exists():
+        return True
+
+    try:
+        binary_mtime = binary.stat().st_mtime
+    except OSError:
+        return True
+
+    for path in worker_sources(root):
+        try:
+            if path.stat().st_mtime > binary_mtime:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def normalize_backend(raw: str) -> str:
@@ -319,15 +366,11 @@ def find_cargo_executable() -> str:
     )
 
 
-def ensure_worker_built(root: Path) -> Path:
+def build_worker(root: Path, cargo: str, reason: str) -> Path:
     binary = worker_binary(root)
-    if binary.exists():
-        return binary
-
-    print("[build] compiling Rust worker...", flush=True)
+    print(f"[build] {reason}，正在编译 Rust worker...", flush=True)
     build_env = os.environ.copy()
     build_env.setdefault("CARGO_HOME", str(root / ".cargo-local"))
-    cargo = find_cargo_executable()
     result = subprocess.run(
         [cargo, "build", "--release"],
         cwd=root / "rust-worker",
@@ -341,6 +384,15 @@ def ensure_worker_built(root: Path) -> Path:
     return binary
 
 
+def ensure_worker_built(root: Path) -> Path:
+    binary = worker_binary(root)
+    cargo = find_cargo_executable()
+    if worker_needs_rebuild(root, binary):
+        reason = "worker 不存在" if not binary.exists() else "检测到 worker 源码已更新"
+        return build_worker(root, cargo, reason)
+    return binary
+
+
 def run_worker(
     binary: Path,
     challenge_hex: str,
@@ -348,26 +400,35 @@ def run_worker(
     backend: str,
     threads: int,
     batch_size: int,
+    work_group_size: int | None,
+    cuda_device: int,
+    cuda_block_size: int,
     progress_ms: int,
     poll_cb,
 ) -> dict[str, Any]:
     difficulty_hex = f"0x{difficulty_int:064x}"
+    command = [
+        str(binary),
+        "--backend",
+        backend,
+        "--challenge",
+        challenge_hex,
+        "--difficulty",
+        difficulty_hex,
+        "--threads",
+        str(threads),
+        "--batch-size",
+        str(batch_size),
+        "--progress-ms",
+        str(progress_ms),
+    ]
+    if backend == "opencl" and work_group_size is not None:
+        command.extend(["--work-group-size", str(work_group_size)])
+    if backend == "cuda":
+        command.extend(["--cuda-device", str(cuda_device)])
+        command.extend(["--cuda-block-size", str(cuda_block_size)])
     proc = subprocess.Popen(
-        [
-            str(binary),
-            "--backend",
-            backend,
-            "--challenge",
-            challenge_hex,
-            "--difficulty",
-            difficulty_hex,
-            "--threads",
-            str(threads),
-            "--batch-size",
-            str(batch_size),
-            "--progress-ms",
-            str(progress_ms),
-        ],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -565,6 +626,24 @@ def parse_args() -> argparse.Namespace:
         default=int(env_value("HASH256_BATCH_SIZE", dotenv, str(default_batch_size()))),
     )
     parser.add_argument(
+        "--work-group-size",
+        type=int,
+        default=default_work_group_size(dotenv),
+        help="OpenCL 本地 work-group size；不填时自动选择",
+    )
+    parser.add_argument(
+        "--cuda-device",
+        type=int,
+        default=default_cuda_device(dotenv),
+        help="CUDA 设备序号，默认 0",
+    )
+    parser.add_argument(
+        "--cuda-block-size",
+        type=int,
+        default=default_cuda_block_size(dotenv),
+        help="CUDA block size，常见可试 128 / 256 / 512",
+    )
+    parser.add_argument(
         "--poll-interval",
         type=int,
         default=int(env_value("HASH256_POLL_INTERVAL", dotenv, str(DEFAULT_POLL_INTERVAL))),
@@ -598,6 +677,12 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(keep_mining=env_flag("HASH256_KEEP_MINING", dotenv, True))
     args = parser.parse_args()
     args.backend = normalize_backend(args.backend)
+    if args.work_group_size is not None and args.work_group_size <= 0:
+        raise SystemExit("--work-group-size 必须 >= 1")
+    if args.cuda_device < 0:
+        raise SystemExit("--cuda-device 必须 >= 0")
+    if args.cuda_block_size <= 0:
+        raise SystemExit("--cuda-block-size 必须 >= 1")
     return args
 
 
@@ -626,7 +711,18 @@ def main() -> int:
     block_number = rpc.block_number()
     worker_backend = args.backend
     print(f"[连接成功] chain_id={chain_id} 当前区块={block_number} miner={miner_address}", flush=True)
-    print(f"[算力配置] backend={worker_backend} threads={args.threads} batch_size={args.batch_size}", flush=True)
+    config_parts = [
+        f"backend={worker_backend}",
+        f"threads={args.threads}",
+        f"batch_size={args.batch_size}",
+    ]
+    if worker_backend == "opencl":
+        wg_value = "auto" if args.work_group_size is None else str(args.work_group_size)
+        config_parts.append(f"work_group_size={wg_value}")
+    if worker_backend == "cuda":
+        config_parts.append(f"cuda_device={args.cuda_device}")
+        config_parts.append(f"cuda_block_size={args.cuda_block_size}")
+    print(f"[算力配置] {' '.join(config_parts)}", flush=True)
     if args.submit:
         print(
             "[自动提交] 已开启 | 持续挖矿=%s | submit-rpc=%s | 最低小费=%s gwei | max-fee倍数=%s | 最多待确认=%s"
@@ -703,11 +799,14 @@ def main() -> int:
                 backend=worker_backend,
                 threads=args.threads,
                 batch_size=args.batch_size,
+                work_group_size=args.work_group_size,
+                cuda_device=args.cuda_device,
+                cuda_block_size=args.cuda_block_size,
                 progress_ms=args.progress_ms,
                 poll_cb=poll_chain,
             )
         except RuntimeError as exc:
-            if worker_backend in {"metal", "opencl"}:
+            if worker_backend in {"metal", "cuda", "opencl"}:
                 print(f"[警告] {worker_backend.upper()} worker 异常退出，自动切换到 CPU。\n{exc}", flush=True)
                 worker_backend = "cpu"
                 print(f"[算力配置] backend={worker_backend} threads={args.threads} batch_size={args.batch_size}", flush=True)
