@@ -480,7 +480,7 @@ def format_restart_reason(reason: str) -> str:
     if reason == "challenge changed":
         return "challenge 已变化，正在使用新 challenge 重新开始"
     if reason == "mint closed":
-        return "链上 mint 已关闭"
+        return "链上 mint 已关闭，返回轮询等待"
     return reason
 
 
@@ -544,6 +544,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-mining", dest="keep_mining", action="store_true", help="持续挖矿")
     parser.add_argument("--no-keep-mining", dest="keep_mining", action="store_false", help="提交后停止")
     parser.set_defaults(keep_mining=env_flag("H98HASH_KEEP_MINING", dotenv, True))
+    parser.add_argument(
+        "--wait-for-mint-open",
+        dest="wait_for_mint_open",
+        action="store_true",
+        help="链上未开放 mint 时持续轮询等待",
+    )
+    parser.add_argument(
+        "--no-wait-for-mint-open",
+        dest="wait_for_mint_open",
+        action="store_false",
+        help="链上未开放 mint 时直接退出",
+    )
+    parser.set_defaults(wait_for_mint_open=env_flag("H98HASH_WAIT_FOR_MINT_OPEN", dotenv, True))
     return parser.parse_args()
 
 
@@ -590,6 +603,7 @@ def main() -> int:
         )
     else:
         print("[自动提交] 未开启，目前只搜索不广播交易", flush=True)
+    print(f"[等待策略] 未开放 mint 时{'自动轮询等待' if args.wait_for_mint_open else '直接退出'}", flush=True)
 
     pending_submissions: list[PendingSubmission] = []
 
@@ -609,8 +623,12 @@ def main() -> int:
             flush=True,
         )
         if not config.mint_open:
-            print("[停止] 链上当前未开放 mint", flush=True)
-            return 0
+            if not args.wait_for_mint_open:
+                print("[停止] 链上当前未开放 mint", flush=True)
+                return 0
+            print(f"[等待中] 链上当前未开放 mint，{args.poll_interval}s 后自动重试", flush=True)
+            time.sleep(args.poll_interval)
+            continue
 
         next_poll = time.monotonic() + args.poll_interval
         challenge_hex = "0x" + challenge.hex()

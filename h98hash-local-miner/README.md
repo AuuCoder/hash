@@ -57,6 +57,7 @@ cp .env.example .env
 
 - `H98HASH_THREADS`
 - `H98HASH_BATCH_SIZE`
+- `H98HASH_WAIT_FOR_MINT_OPEN`
 - `H98HASH_SUBMIT_RPC_URL`
 - `H98HASH_MIN_PRIORITY_FEE_GWEI`
 - `H98HASH_MAX_FEE_MULTIPLIER`
@@ -86,5 +87,6 @@ python3 miner.py --submit
 - 当前实现是 **独立本地矿工**，不依赖网页。
 - 当前 worker 支持 CPU 和 Metal GPU。
 - 如果链上参数发生变化，程序会自动重新拉取 challenge 和 difficulty。
+- 如果链上当前没开放 mint，默认会按 `H98HASH_POLL_INTERVAL` 自动轮询等待。
 - 提交后默认立即继续下一轮，不会阻塞在等回执。
 - 如果 `metal` worker 异常退出，`miner.py` 会自动回退到 `cpu`。
